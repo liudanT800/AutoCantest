@@ -88,15 +88,31 @@ void __stdcall SetChannelFilter(int can_idx, const unsigned int* ids, int count)
 
 ## 3. Python (ctypes) 调用模版
 
-请将 `my_can_bridge.dll` 和周立功官方的 `ControlCAN.dll` 放置于 Python 脚本所在的同级目录中。
+请确保 `my_can_bridge.dll` 和周立功官方的 `ControlCAN.dll` 均已放置于 `bin/` 目录下。
 
 ```python
 import ctypes
 import time
 import os
 
-# 1. 加载 DLL (Windows 64位环境建议使用 WinDLL 或 CDLL 均可)
-dll_path = os.path.abspath("my_can_bridge.dll")
+# 1. 声明并注册 DLL 搜索目录，预加载依赖的 ControlCAN.dll
+dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+if hasattr(os, "add_dll_directory"):
+    try:
+        os.add_dll_directory(dll_dir)
+    except Exception:
+        pass
+
+# 预加载依赖库 (防止 Windows 下报错: Error 126 找不到模块依赖项)
+dep_path = os.path.join(dll_dir, "ControlCAN.dll")
+if os.path.exists(dep_path):
+    try:
+        ctypes.WinDLL(dep_path)
+    except Exception:
+        pass
+
+# 加载包装动态库 my_can_bridge.dll
+dll_path = os.path.join(dll_dir, "my_can_bridge.dll")
 can_dll = ctypes.WinDLL(dll_path)
 
 # 2. 声明 C 接口的参数类型和返回值类型
