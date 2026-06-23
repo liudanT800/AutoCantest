@@ -151,7 +151,91 @@ else:
 
 ---
 
-## 4. 编译参数调整说明
+## 4. CAN 常驻服务与命名管道通信 (can_service.py)
+
+为了方便多脚本并发测试与防冲突，本项目提供了一个常驻的后台守护服务 `can_service.py`。该服务会在后台独占打开物理 CAN 设备，并通过 Windows 命名管道（Named Pipe）暴露控制接口。
+
+### 🌟 核心设计优势
+- **物理通道保活**：无需在每个测试脚本中反复初始化/关闭硬件通道。
+- **自动异步监听**：守护服务内置独立的 C++ 接收线程，将所有接收到的报文实时带时间戳追加到本地日志文件（`logs/can_bus_YYYY-MM-DD.log`）中。
+- **“脱手即停”安全机制**：客户端脚本下发高频发送任务后，若测试脚本被意外中止或手动 Ctrl+C，守护服务会通过管道连接状态自动感知，并**立刻停止**向总线发送报文，防止总线拥堵与硬件失控。
+
+### 1) 启动常驻服务
+在命令行（已激活对应 Conda 或 Python 环境）中启动后台服务：
+```powershell
+# 使用默认配置启动（USBCAN2, 250kbps, CAN1 通道）
+python can_service.py
+
+# 自定义参数启动
+python can_service.py --dev-type 4 --baud 500 --can-idx 0 --log-file logs/can_bus_test.log
+```
+**命令行参数说明：**
+- `--dev-type`: 设备类型（默认 `4` = USBCAN2）
+- `--baud`: 波特率 kbps（默认 `250`）
+- `--can-idx`: 通道索引（默认 `0` = CAN1 通道，`1` 为 CAN2 通道）
+- `--log-file`: 接收报文日志输出路径（默认按天自动切分）
+
+---
+
+### 2) 客户端调用与任务契约
+客户端脚本使用 Python 标准库 `multiprocessing.connection.Client` 即可通过管道双向通信。命名管道地址为 `\\.\pipe\cantest_pipe`，授权密钥为 `cantest`。
+
+#### A. 下发发送与比对任务 (action: "run")
+客户端通过向管道发送 Python `dict` 来下发任务：
+```python
+from multiprocessing.connection import Client
+
+PIPE_ADDRESS = r'\\.\pipe\cantest_pipe'
+AUTH_KEY = b'cantest'
+
+# 构造任务载荷
+payload = {
+    "action": "run",
+    "repeat_count": 100,            # 组循环次数
+    "group_interval_ms": 100,       # 组间延迟 (ms)
+    "frame_interval_ms": 10,        # 帧间延迟 (ms)
+    "filter_ids": ["0x18070190"],   # 仅关注并过滤的接收 ID
+    "expect": {                     # 预期比对规则 (选填)
+        "id": "0x18070190",
+        "data_pattern": "01 07 ** ** ** ** ** **", # 支持 * / ** 通配符
+        "timeout_ms": 2000
+    },
+    "frames": [
+        {"id": "0x18FEF500", "data": "0A FF FF 10 27 FF FF FF"},
+        {"id": "0x0CF00400", "data": "FF FF 7E 50 01 FF FF FF"}
+    ]
+}
+
+conn = Client(PIPE_ADDRESS, authkey=AUTH_KEY)
+conn.send(payload)
+result = conn.recv()  # 阻塞等待服务比对或发送结果
+print("执行结果:", result)
+conn.close()
+```
+
+#### B. 查询服务运行状态 (action: "status")
+可用于查询当前服务连接的硬件参数、运行时间以及日志路径：
+```python
+conn.send({"action": "status"})
+status_info = conn.recv()
+```
+
+#### C. 强行中止任务 (action: "abort")
+若需要强行打断当前正在运行的大循环发送任务，可由另一个独立客户端发送 `abort` 信号：
+```python
+conn.send({"action": "abort"})
+```
+
+---
+
+### 3) 典型客户端与仿真示例
+- **[send_payload.py](file:///d:/code_field/Auto%20Cantest/can/send_payload.py)**：通用报文下发客户端，支持模式 1（单次轮流发送所有帧）与模式 2（持续高频周期性重发特定帧）。
+- **[simulators/simulate_bms.py](file:///d:/code_field/Auto%20Cantest/can/simulators/simulate_bms.py)**：用于模拟 BMS (电池管理系统) 的自动应答和状态报文周期循环发送。
+- **[simulators/simulate_speed_limit.py](file:///d:/code_field/Auto%20Cantest/can/simulators/simulate_speed_limit.py)**：模拟仪表响应最高限速等状态更改的应答数据。
+
+---
+
+## 5. 编译参数调整说明
 
 若您需要自行重新编译 DLL，请在 MinGW 终端中使用以下命令。
 *注：`"-Wl,--kill-at"` 选项用于剥离 `@符号`，使 Python 能够直接通过函数名调用；`-static-libgcc -static-libstdc++` 选项用于静态链接 GCC 运行时，防止 Python 报“找不到模块依赖项”的错误。*
@@ -160,3 +244,4 @@ else:
 # 编译命令
 g++ -shared my_can_bridge.cpp lib\ControlCAN.lib -o bin\my_can_bridge.dll -std=c++17 -O2 -Wall -static-libgcc -static-libstdc++ "-Wl,--kill-at"
 ```
+
