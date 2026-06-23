@@ -158,5 +158,5 @@ else:
 
 ```powershell
 # 编译命令
-D:\mingw64\bin\g++.exe -shared my_can_bridge.cpp lib\ControlCAN.lib -o bin\my_can_bridge.dll -std=c++17 -O2 -Wall -static-libgcc -static-libstdc++ "-Wl,--kill-at"
+g++ -shared my_can_bridge.cpp lib\ControlCAN.lib -o bin\my_can_bridge.dll -std=c++17 -O2 -Wall -static-libgcc -static-libstdc++ "-Wl,--kill-at"
 ```
