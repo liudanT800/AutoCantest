@@ -8,23 +8,28 @@ import sys
 PIPE_ADDRESS = r'\\.\pipe\cantest_pipe'
 AUTH_KEY = b'cantest'
 
-# 1 or 2
-SEND_MODE = 1 
+SEND_MODE = 1 # 1 or 2
 REPEAT_COUNT = 100000
 REPEAT_GROUP_INTERVAL_MS = 100
 REPEAT_FRAME_INTERVAL_MS = 10
 
 raw_frames_tmp = """
-18FEF500 0A FF FF 10 27 FF FF FF
-0CF00400 FF FF 7E 50 01 FF FF FF
-18FEDF00 7F FF FF FF FF FF FF FF
-18FEF200 10 27 FF FF FF FF FF FF
-0CF00A00 FF FF 10 27 FF FF FF FF
-18FDB200 FF FF FF FF 0A 00 FF FF
-18FEEE00 2A FF FF FF FF FF FF FF
-0CFF0F00 FF 0A FF FF FF FF FF FF
-18FD9400 10 27 FF FF FF FF FF FF
-18FDD500 FF FF FF FF 10 27 FF FF
+18ecff00 20 0A 00 02 FF CA FE 00
+18ebff00 01 40 FF CE 0C 00 04 55
+18ebff00 02 F1 E0 05 FF FF FF FF
+"""
+
+raw_frames_status = """
+    18FEF500 0A FF FF 10 27 FF FF FF
+    0CF00400 FF FF 7E 50 01 FF FF FF
+    18FEDF00 7E FF FF FF FF FF FF FF
+    18FEF200 10 27 FF FF FF FF FF FF
+    0CF00A00 FF FF 10 27 FF FF FF FF
+    18FDB200 FF FF FF FF 0A 00 FF FF
+    18FEEE00 2A FF FF FF FF FF FF FF
+    0CFF0F00 FF 0A FF FF FF FF FF FF
+    18FD9400 10 27 FF FF FF FF FF FF
+    18FDD500 FF FF FF FF 10 27 FF FF
 """
 
 raw_frames_alarm = """
@@ -85,6 +90,34 @@ payload = {
     "frame_interval_ms": REPEAT_FRAME_INTERVAL_MS,
     "frames": frames,
 }
+
+# 打印发送模式与报文列表信息
+print("=" * 60)
+if SEND_MODE == 1:
+    print(f"发送模式: [模式 1] 轮流发送所有帧")
+    print(f"参数配置: 组循环次数={REPEAT_COUNT}, 组内帧间延迟={REPEAT_FRAME_INTERVAL_MS}ms, 组间延迟={REPEAT_GROUP_INTERVAL_MS}ms")
+elif SEND_MODE == 2:
+    print(f"发送模式: [模式 2] 逐帧重发持续发送")
+    print(f"参数配置: 单帧持续={single_frame_duration_s}s, 周期发送间隔={frame_interval_ms}ms")
+    print(f"          组循环次数={REPEAT_COUNT}, 组内帧间延迟={REPEAT_FRAME_INTERVAL_MS}ms, 组间延迟={REPEAT_GROUP_INTERVAL_MS}ms")
+else:
+    print(f"发送模式: 未知模式 ({SEND_MODE})")
+
+unique_input_frames = []
+for line in raw_frames.strip().split('\n'):
+    parts = line.split(maxsplit=1)
+    if len(parts) == 2:
+        fid = parts[0].strip()
+        if not fid.startswith("0x"):
+            fid = "0x" + fid
+        fdata = parts[1].strip()
+        unique_input_frames.append((fid, fdata))
+
+print(f"待发送的报文列表 (共 {len(unique_input_frames)} 种报文):")
+for idx, (fid, fdata) in enumerate(unique_input_frames, 1):
+    print(f"  [{idx}] ID: {fid} | Data: {fdata}")
+print(f"生成待发送队列总帧数: {len(frames)} 帧")
+print("=" * 60)
 
 conn = None
 try:
