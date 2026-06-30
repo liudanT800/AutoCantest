@@ -2,3 +2,4 @@ simulators/simulate_bms.py
 simulators/simulate_speed_limit.py
 *.log
 *.pyc
+payload.py

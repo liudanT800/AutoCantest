@@ -5,131 +5,93 @@ CAN 报文发送客户端
 from multiprocessing.connection import Client
 import sys
 from datetime import datetime
+import re
+import os
 
 PIPE_ADDRESS = r'\\.\pipe\cantest_pipe'
 AUTH_KEY = b'cantest'
 
-SEND_MODE = 1 # 1 or 2
-REPEAT_COUNT = 1000000
-REPEAT_GROUP_INTERVAL_MS = 100
-REPEAT_FRAME_INTERVAL_MS = 50
+# 动态确保脚本所在目录在 sys.path 中，以正确导入 payload.py
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 
-raw_frames_tmp = """
-0CFF0F00  11 63 33 44 55 66 77 88
-0CFE2020  21 21 21 21 21 21 21 21
+# 确保 payload.py 存在，若不存在，自动从默认配置创建
+payload_path = os.path.join(script_dir, "payload.py")
+if not os.path.exists(payload_path):
+    default_payload = """
+        # CAN 报文发送配置 (已加入 .gitignore，本地修改不会被 Git 追踪)
+        SEND_MODE = 1 # 1 or 2
+        REPEAT_COUNT = 1000000
+        SEND_DURATION_S = None  # 发送时间(秒)，与 REPEAT_COUNT 二选一，若设置了该值，则自动通过间隔和时长反推发送次数并覆盖 REPEAT_COUNT
+        REPEAT_GROUP_INTERVAL_MS = 100
+        REPEAT_FRAME_INTERVAL_MS = 50
+
+        raw_frames_tmp = \"\"\"
+            012345678  00 00 00 00 00 00 00 00
+        \"\"\"
+
+        raw_frames = raw_frames_tmp
+
+        single_frame_duration_s = 5
+        frame_interval_ms = 200
 """
+    with open(payload_path, "w", encoding="utf-8") as f:
+        f.write(default_payload)
 
-raw_frames_status = """
-18050036  01 02 03 04 05 06 07 08
-18050032  01 02 03 04 05 06 07 08
-1805003A  01 02 03 04 05 06 07 08
-18050196  01 02 03 04 05 06 07 08
-18050042  01 02 03 04 05 06 07 08
-18050046  01 02 03 04 05 06 07 08
-18050062  01 02 03 04 05 06 07 08
-182222F0  01 02 03 04 05 06 07 08
-18050066  01 02 03 04 05 06 07 08
-18050192  01 02 03 04 05 06 07 08
-1805004A  01 02 03 04 05 06 07 08
-1805005A  01 02 03 04 05 06 07 08
-1805003E  01 02 03 04 05 06 07 08
-182222F1  01 02 03 04 05 06 07 08
-F8FF234A  01 02 03 04 05 06 07 08
-F8FF244A  01 02 03 04 05 06 07 08
-180500F6  01 02 03 04 05 06 07 08
-03010101  01 02 03 04 05 06 07 08
-03030701  01 02 03 04 05 06 07 08
-03010501  01 02 03 04 05 06 07 08
-03010601  01 02 03 04 05 06 07 08
-03020501  01 02 03 04 05 06 07 08
-03020904  01 02 03 04 05 06 07 08
-03010602  01 02 03 04 05 06 07 08
-03010201  01 02 03 04 05 06 07 08
-1805004E  01 02 03 04 05 06 07 08
-18050052  01 02 03 04 05 06 07 08
-18050056  01 02 03 04 05 06 07 08
-180500B6  01 02 03 04 05 06 07 08
-180500BA  01 02 03 04 05 06 07 08
-03010301  01 02 03 04 05 06 07 08
-03030601  01 02 03 04 05 06 07 08
-1805005E  01 02 03 04 05 06 07 08
-18050062  01 02 03 04 05 06 07 08
-18050066  01 02 03 04 05 06 07 08
-1805005E  01 02 03 04 05 06 07 08
-1805006A  01 02 03 04 05 06 07 08
-1805006E  01 02 03 04 05 06 07 08
-18050072  01 02 03 04 05 06 07 08
-18050076  01 02 03 04 05 06 07 08
-1805007A  01 02 03 04 05 06 07 08
-1805007E  01 02 03 04 05 06 07 08
-18050082  01 02 03 04 05 06 07 08
-18050086  01 02 03 04 05 06 07 08
-1805008A  01 02 03 04 05 06 07 08
-1805009A  01 02 03 04 05 06 07 08
-1805009E  01 02 03 04 05 06 07 08
-180500A2  01 02 03 04 05 06 07 08
-180500A6  01 02 03 04 05 06 07 08
-180500AA  01 02 03 04 05 06 07 08
-180500AE  01 02 03 04 05 06 07 08
-180500B2  01 02 03 04 05 06 07 08
-180500F2  01 02 03 04 05 06 07 08
-03020803  01 02 03 04 05 06 07 08
-03020A05  01 02 03 04 05 06 07 08
-03030101  01 02 03 04 05 06 07 08
-03030201  01 02 03 04 05 06 07 08
-03030501  01 02 03 04 05 06 07 08
-03010701  01 02 03 04 05 06 07 08
-1805006A  01 02 03 04 05 06 07 08
-1805008E  01 02 03 04 05 06 07 08
-03020201  01 02 03 04 05 06 07 08
-03020302  01 02 03 04 05 06 07 08
-03020B02  01 02 03 04 05 06 07 08
-03010401  01 02 03 04 05 06 07 08
-03020101  01 02 03 04 05 06 07 08
-03020601  01 02 03 04 05 06 07 08
-03020401  01 02 03 04 05 06 07 08
-03020502  01 02 03 04 05 06 07 08
-03020702  01 02 03 04 05 06 07 08
-18050096  01 02 03 04 05 06 07 08
-"""
+try:
+    from payload import (
+        SEND_MODE,
+        REPEAT_COUNT,
+        SEND_DURATION_S,
+        REPEAT_GROUP_INTERVAL_MS,
+        REPEAT_FRAME_INTERVAL_MS,
+        raw_frames,
+        single_frame_duration_s,
+        frame_interval_ms,
+    )
+except ImportError as e:
+    print(f"错误: 导入 payload 失败: {e}")
+    sys.exit(1)
 
-raw_frames_alarm = """
-    226 FF FF FF FF FF FF FF 59
-    226 FF FF FF FF FF FF FF 60
-    226 FF FF FF FF FF FF FF 61
-    226 FF FF FF FF FF FF FF 62
-    226 FF FF FF FF FF FF FF 63
-    226 FF FF FF FF FF FF FF 64
-    226 FF FF FF FF FF FF FF 65
-    226 FF FF FF FF FF FF FF 66
-    226 FF FF FF FF FF FF FF 67
-    226 FF FF FF FF FF FF FF 68
-    226 FF FF FF FF FF FF FF 69
-    226 FF FF FF FF FF FF FF 6A
-    226 FF FF FF FF FF FF FF 6B
-    226 FF FF FF FF FF FF FF 6C
-    226 FF FF FF FF FF FF FF 6D
-    226 FF FF FF FF FF FF FF 6E
-    226 FF FF FF FF FF FF FF 6F
-    226 FF FF FF FF FF FF FF 70
-    226 FF FF FF FF FF FF FF 71
-    226 FF FF FF FF FF FF FF 72
-    226 FF FF FF FF FF FF FF 73
-"""
-
-raw_frames = raw_frames_tmp
-
-single_frame_duration_s = 5
-frame_interval_ms = 200
+# ============================================================================
+# 报文解析清洗函数
+# ============================================================================
+def parse_raw_frame_line(line):
+    # 1. 移除可能包含的括号及之后的注释内容
+    line_clean = re.split(r'[(（]', line)[0].strip()
+    
+    # 2. 按空白字符分割
+    parts = line_clean.split()
+    if not parts:
+        return None
+        
+    frame_id = parts[0]
+    if not frame_id.startswith("0x"):
+        frame_id = "0x" + frame_id
+        
+    # 3. 过滤并提取后续的有效十六进制字节 (最多8个字节)
+    data_bytes = []
+    for p in parts[1:]:
+        if len(data_bytes) >= 8:
+            break
+        # 检查是否为合法的1或2位十六进制数
+        if len(p) in (1, 2) and all(c in '0123456789abcdefABCDEF' for c in p):
+            data_bytes.append(p)
+        else:
+            # 遇到非十六进制字符，直接截断
+            break
+            
+    if not data_bytes:
+        return None
+        
+    return frame_id, " ".join(data_bytes)
 
 frames = []
 for line in raw_frames.strip().split('\n'):
-    parts = line.split(maxsplit=1)
-    if len(parts) == 2:
-        frame_id = parts[0].strip()
-        if frame_id[:2] != "0x":
-            frame_id = "0x" + frame_id
-        data = parts[1].strip()
+    parsed = parse_raw_frame_line(line)
+    if parsed:
+        frame_id, data = parsed
         
         def send_mode_2(): #发送一帧，持续 single_frame_duration_s (以 frame_interval_ms 为间隔周期发送)
             repeat_each = int(single_frame_duration_s * 1000 / frame_interval_ms)
@@ -143,6 +105,19 @@ for line in raw_frames.strip().split('\n'):
             send_mode_1()
         elif SEND_MODE == 2:
             send_mode_2()
+
+if SEND_DURATION_S is not None:
+    if len(frames) > 0:
+        one_group_duration_ms = (len(frames) - 1) * REPEAT_FRAME_INTERVAL_MS + REPEAT_GROUP_INTERVAL_MS
+        if one_group_duration_ms > 0:
+            target_time_ms = SEND_DURATION_S * 1000
+            calculated_repeat_count = max(1, int(round((target_time_ms + REPEAT_GROUP_INTERVAL_MS) / one_group_duration_ms)))
+            print(f"已设置发送时间 {SEND_DURATION_S}s，自动反推并覆盖组循环次数: {REPEAT_COUNT} -> {calculated_repeat_count}")
+            REPEAT_COUNT = calculated_repeat_count
+        else:
+            REPEAT_COUNT = 1
+    else:
+        REPEAT_COUNT = 1
 
 payload = {
     "action": "run",
@@ -166,12 +141,9 @@ else:
 
 unique_input_frames = []
 for line in raw_frames.strip().split('\n'):
-    parts = line.split(maxsplit=1)
-    if len(parts) == 2:
-        fid = parts[0].strip()
-        if not fid.startswith("0x"):
-            fid = "0x" + fid
-        fdata = parts[1].strip()
+    parsed = parse_raw_frame_line(line)
+    if parsed:
+        fid, fdata = parsed
         unique_input_frames.append((fid, fdata))
 
 print(f"待发送的报文列表 (共 {len(unique_input_frames)} 种报文):")
