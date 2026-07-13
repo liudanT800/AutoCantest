@@ -6,3 +6,5 @@ __pycache__/
 logs/
 payload/payload.py
 auto_reply/auto_reply_rules.py
+*.json
+*_data.py
