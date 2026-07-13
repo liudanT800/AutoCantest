@@ -33,8 +33,8 @@ if not os.path.exists(payload_path):
 
         raw_frames = raw_frames_tmp
 
-        single_frame_duration_s = 5
-        frame_interval_ms = 200
+        SINGLE_FRAME_DURATION_S = 5
+        FRAME_INTERVAL_MS = 200
 """
     with open(payload_path, "w", encoding="utf-8") as f:
         f.write(default_payload)
@@ -47,8 +47,8 @@ try:
         REPEAT_GROUP_INTERVAL_MS,
         REPEAT_FRAME_INTERVAL_MS,
         raw_frames,
-        single_frame_duration_s,
-        frame_interval_ms,
+        SINGLE_FRAME_DURATION_S,
+        FRAME_INTERVAL_MS,
     )
 except ImportError as e:
     print(f"错误: 导入 payload 失败: {e}")
@@ -59,7 +59,7 @@ except ImportError as e:
 # ============================================================================
 def parse_raw_frame_line(line):
     # 1. 移除可能包含的括号及之后的注释内容
-    line_clean = re.split(r'[(（]', line)[0].strip()
+    line_clean = re.split(r'[(（#]', line)[0].strip()
     
     # 2. 按空白字符分割
     parts = line_clean.split()
@@ -87,17 +87,36 @@ def parse_raw_frame_line(line):
         
     return frame_id, " ".join(data_bytes)
 
+
+def normalize_raw_frames(raw_input):
+    """兼容支持 str、list[str]、嵌套列表等格式，方便在 IDE 中用 [] 折叠多行报文"""
+    if isinstance(raw_input, str):
+        return raw_input.strip().split('\n')
+    elif isinstance(raw_input, (list, tuple)):
+        lines = []
+        for item in raw_input:
+            if isinstance(item, str):
+                lines.extend(item.strip().split('\n'))
+            elif isinstance(item, (list, tuple)):
+                lines.extend(normalize_raw_frames(item))
+            elif isinstance(item, dict) and "id" in item and "data" in item:
+                lines.append(f"{item['id']} {item['data']}")
+        return lines
+    return []
+
+
+raw_lines = normalize_raw_frames(raw_frames)
 frames = []
-for line in raw_frames.strip().split('\n'):
+for line in raw_lines:
     parsed = parse_raw_frame_line(line)
     if parsed:
         frame_id, data = parsed
         
         def send_mode_2(): #发送一帧，持续 single_frame_duration_s (以 frame_interval_ms 为间隔周期发送)
-            repeat_each = int(single_frame_duration_s * 1000 / frame_interval_ms)
+            repeat_each = int(SINGLE_FRAME_DURATION_S * 1000 / FRAME_INTERVAL_MS)
             for _ in range(repeat_each):
                 frames.append({"id": frame_id, "data": data})
-
+            
         def send_mode_1(): #轮流发送所有帧,每帧间隔 single_frame_duration_s，每轮间隔 frame_interval_ms
             frames.append({"id": frame_id, "data": data})
 
@@ -123,33 +142,33 @@ payload = {
     "action": "run",
     "repeat_count": REPEAT_COUNT,
     "group_interval_ms": REPEAT_GROUP_INTERVAL_MS,
-    "frame_interval_ms": REPEAT_FRAME_INTERVAL_MS,
+    "frame_interval_ms": REPEAT_FRAME_INTERVAL_MS if SEND_MODE == 1 else FRAME_INTERVAL_MS,
     "frames": frames,
 }
 
 # 打印发送模式与报文列表信息
-print("=" * 60)
-if SEND_MODE == 1:
-    print(f"发送模式: [模式 1] 轮流发送所有帧")
-    print(f"参数配置: 组循环次数={REPEAT_COUNT}, 组内帧间延迟={REPEAT_FRAME_INTERVAL_MS}ms, 组间延迟={REPEAT_GROUP_INTERVAL_MS}ms")
-elif SEND_MODE == 2:
-    print(f"发送模式: [模式 2] 逐帧重发持续发送")
-    print(f"参数配置: 单帧持续={single_frame_duration_s}s, 周期发送间隔={frame_interval_ms}ms")
-    print(f"          组循环次数={REPEAT_COUNT}, 组内帧间延迟={REPEAT_FRAME_INTERVAL_MS}ms, 组间延迟={REPEAT_GROUP_INTERVAL_MS}ms")
-else:
-    print(f"发送模式: 未知模式 ({SEND_MODE})")
 
 unique_input_frames = []
-for line in raw_frames.strip().split('\n'):
+for line in raw_lines:
     parsed = parse_raw_frame_line(line)
     if parsed:
         fid, fdata = parsed
         unique_input_frames.append((fid, fdata))
-
 print(f"待发送的报文列表 (共 {len(unique_input_frames)} 种报文):")
 for idx, (fid, fdata) in enumerate(unique_input_frames, 1):
     print(f"  [{idx}]\t ID: {fid} | Data: {fdata}")
 print(f"生成待发送队列总帧数: {len(frames)} 帧")
+print("=" * 60)
+
+if SEND_MODE == 1:
+    print(f"发送模式: [模式 1] 轮流发送所有帧")
+    print(f"参数配置: 组循环次数={REPEAT_COUNT}, 组内帧间延迟={REPEAT_FRAME_INTERVAL_MS}ms, 组间延迟={REPEAT_GROUP_INTERVAL_MS}ms")
+elif SEND_MODE == 2:
+    print(f"发送模式: [模式 2] 单帧重复发送")
+    print(f"参数配置: 单帧持续={SINGLE_FRAME_DURATION_S}s, 周期发送间隔={FRAME_INTERVAL_MS}ms")
+    print(f"          组循环次数={REPEAT_COUNT}, 组内帧间延迟={REPEAT_FRAME_INTERVAL_MS}ms, 组间延迟={REPEAT_GROUP_INTERVAL_MS}ms")
+else:
+    print(f"发送模式: 未知模式 ({SEND_MODE})")
 print("=" * 60)
 
 conn = None
