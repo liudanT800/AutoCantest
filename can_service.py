@@ -17,6 +17,7 @@ import json
 import argparse
 import signal
 import threading
+import queue
 import logging
 from multiprocessing.connection import Listener
 from datetime import datetime
@@ -43,6 +44,7 @@ DEFAULT_LOG_LEVEL  = logging.DEBUG  # 日志级别 (DEBUG / INFO / WARNING)
 RX_POLL_INTERVAL_S        = 0.005    # 接收线程空闲轮询间隔 (秒)
 DEFAULT_TX_DATA           = "00 00 00 00 00 00 00 00"  # 帧数据缺省值 (8字节)
 DEFAULT_EXPECT_TIMEOUT_MS = 2000   # expect 匹配默认超时 (毫秒)
+AUTO_REPLY_POLL_INTERVAL_S = 0.001  # 自动回复发送线程队列轮询间隔
 
 
 # ============================================================================
@@ -137,6 +139,10 @@ class SharedState:
         self.abort_event = threading.Event()
         # --- 防止多个 run 任务并发执行 ---
         self.run_lock = threading.Lock()
+        # --- 自动查表回复 ---
+        self.auto_reply_rules: dict = {}        # {match_id: [(compiled_pattern, reply_frames), ...]}
+        self.auto_reply_enabled: bool = False
+        self.reply_queue: queue.Queue = queue.Queue()  # 元素: (can_id, data_str, delay_ms)
 
     def set_expect(self, expect_id: int | None, pattern: str | None):
         """设置新一轮的期望匹配参数（由任务处理线程调用）"""
@@ -181,6 +187,82 @@ class SharedState:
             except Exception:
                 pass
 
+    # ---- 自动查表回复 ----
+    def setup_auto_reply(self, rules: list, can_idx: int):
+        """编译规则表，构建 O(1) 查找结构（由管道处理线程调用）"""
+        compiled: dict = {}
+        for rule in rules:
+            try:
+                mid = _parse_id(rule["match_id"])
+                pattern_str = rule.get("match_pattern") or rule.get("match_data_pattern")
+
+                # 预编译匹配模式: [(byte_index, expected_byte), ...]
+                compiled_pattern: list = []
+                if pattern_str:
+                    for i, byte in enumerate(pattern_str.split()):
+                        if byte not in ("**", "*") and i < 8:
+                            compiled_pattern.append((i, byte.upper()))
+
+                # 预编译回复帧: [(can_id, data_str, delay_ms), ...]
+                reply_frames: list = []
+                for rf in rule.get("reply_frames", []):
+                    rid = _parse_id(rf["id"])
+                    rdata = rf.get("data", "00 00 00 00 00 00 00 00")
+                    rdelay = int(rf.get("delay_ms", 0))
+                    reply_frames.append((rid, rdata, rdelay))
+
+                compiled.setdefault(mid, []).append((compiled_pattern, reply_frames))
+            except Exception as e:
+                logger.error(f"[自动回复] 规则解析失败: {rule}, 错误: {e}")
+
+        # 原子替换（CPython GIL 保证引用赋值原子性）
+        self.auto_reply_rules = compiled
+        self.auto_reply_enabled = True
+        logger.info(f"[自动回复] 规则已加载，共 {sum(len(v) for v in compiled.values())} 条，覆盖 {len(compiled)} 个 ID")
+
+    def clear_auto_reply(self):
+        """停用自动回复并清空待发送队列"""
+        self.auto_reply_enabled = False
+        self.auto_reply_rules.clear()
+        while not self.reply_queue.empty():
+            try:
+                self.reply_queue.get_nowait()
+            except queue.Empty:
+                break
+        logger.info("[自动回复] 已停用，待发送队列已清空")
+
+    def check_auto_reply(self, msg_str: str):
+        """快速查表匹配并异步入队回复帧（由接收线程调用，热路径，不允许阻塞）"""
+        if not self.auto_reply_enabled:
+            return
+        try:
+            if "ID:" not in msg_str or "Data:" not in msg_str:
+                return
+            id_part = msg_str.split("ID:")[1].split("|")[0]
+            msg_id = int(id_part, 16) if id_part.lower().startswith("0x") else int(id_part)
+            data_part = msg_str.split("Data:")[1].strip()
+            data_bytes = data_part.split()
+
+            # O(1) 字典查找
+            rules = self.auto_reply_rules.get(msg_id)
+            if not rules:
+                return
+
+            for compiled_pattern, reply_frames in rules:
+                # 快速模式匹配（仅比较非通配符位置）
+                match = True
+                for idx, expected in compiled_pattern:
+                    if idx >= len(data_bytes) or data_bytes[idx].upper() != expected:
+                        match = False
+                        break
+                if match:
+                    # 非阻塞入队
+                    for frame in reply_frames:
+                        self.reply_queue.put(frame)
+                    return  # 首条匹配即停止
+        except Exception:
+            pass  # 热路径静默吞异常，保证接收线程不崩溃
+
 
 def _match_data_pattern(data_str: str, pattern: str) -> bool:
     """
@@ -213,6 +295,49 @@ def _parse_id(raw_id) -> int:
     if isinstance(raw_id, str):
         return int(raw_id, 16) if raw_id.lower().startswith("0x") else int(raw_id)
     return int(raw_id)
+
+
+# ============================================================================
+# 线程 2.5：自动回复发送器 (后台守护线程)
+# ============================================================================
+def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState, stop_event: threading.Event):
+    """独立发送线程，从 reply_queue 取帧发送，带可中断延迟，永不阻塞接收线程"""
+    logger.info("[自动回复] 发送线程已启动")
+    while not stop_event.is_set():
+        try:
+            reply_id, data_str, delay_ms = state.reply_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if stop_event.is_set():
+            break
+
+        try:
+            if delay_ms > 0:
+                # 小步长 sleep，便于快速响应 stop_event
+                remaining = delay_ms / 1000.0
+                while remaining > 0 and not stop_event.is_set():
+                    time.sleep(min(remaining, 0.01))
+                    remaining -= 0.01
+                if stop_event.is_set():
+                    break
+
+            tx_data = data_str.encode("utf-8")
+            ret = dll.SendCanHex(dev_type, reply_id, tx_data, can_idx)
+            if ret == 1:
+                logger.debug(f"[自动回复] → 0x{reply_id:X} | {data_str}")
+            else:
+                logger.warning(f"[自动回复] SendCanHex 返回 {ret}")
+        except Exception as e:
+            logger.error(f"[自动回复] 发送异常: {e}")
+
+    # 退出前清空队列避免残留
+    while not state.reply_queue.empty():
+        try:
+            state.reply_queue.get_nowait()
+        except queue.Empty:
+            break
+    logger.info("[自动回复] 发送线程已停止")
 
 
 # ============================================================================
@@ -249,6 +374,9 @@ def receiver_thread_func(dll, can_idx: int, state: SharedState, log_file: str, s
 
                 # 尝试与 expect 规则比对
                 state.check_and_match(msg_str)
+
+                # 尝试与自动回复规则比对 (O(1) 查表 + 异步入队，不阻塞)
+                state.check_auto_reply(msg_str)
             else:
                 # 队列为空，短暂休眠以避免占满 CPU
                 time.sleep(RX_POLL_INTERVAL_S)
@@ -461,6 +589,33 @@ def handle_connection(conn, dll, state: SharedState, cfg: dict, stop_event: thre
             conn.send({"status": "ABORT_REQUESTED", "message": "已下发中止指令"})
             return
 
+        # ---- auto_reply_start: 启用自动查表回复 ----
+        if action == "auto_reply_start":
+            rules = msg.get("rules", [])
+            if not rules:
+                conn.send({"status": "ERROR", "message": "rules 为空，请提供至少一条规则"})
+                return
+            state.setup_auto_reply(rules, cfg["can_idx"])
+            rule_count = sum(len(v) for v in state.auto_reply_rules.values())
+            conn.send({"status": "OK", "message": f"自动回复已启用，{rule_count} 条规则"})
+            return
+
+        # ---- auto_reply_stop: 停用自动回复 ----
+        if action == "auto_reply_stop":
+            state.clear_auto_reply()
+            conn.send({"status": "OK", "message": "自动回复已停用"})
+            return
+
+        # ---- auto_reply_status: 查看自动回复状态 ----
+        if action == "auto_reply_status":
+            conn.send({
+                "status": "OK",
+                "auto_reply_enabled": state.auto_reply_enabled,
+                "rule_count": sum(len(v) for v in state.auto_reply_rules.values()) if state.auto_reply_rules else 0,
+                "queue_size": state.reply_queue.qsize(),
+            })
+            return
+
         # ---- run ----
         if action == "run":
             # 防止多个 run 任务并发
@@ -492,7 +647,7 @@ def handle_connection(conn, dll, state: SharedState, cfg: dict, stop_event: thre
             return
 
         # ---- 未知操作 ----
-        conn.send({"status": "ERROR", "message": f"未知操作: {action}，可用: run / status / abort"})
+        conn.send({"status": "ERROR", "message": f"未知操作: {action}，可用: run / status / abort / auto_reply_start / auto_reply_stop / auto_reply_status"})
 
     except EOFError:
         logger.info("[PIPE] 客户端在读取消息前断开连接")
@@ -567,6 +722,15 @@ def main():
     )
     rx_thread.start()
 
+    # ---- 启动自动回复发送线程 ----
+    ar_tx_thread = threading.Thread(
+        target=auto_reply_sender_func,
+        args=(dll, args.dev_type, args.can_idx, state, stop_event),
+        name="AutoReplySender",
+        daemon=True,
+    )
+    ar_tx_thread.start()
+
     # ---- 构建运行时配置 ----
     cfg = {
         "dev_type": args.dev_type,
@@ -584,6 +748,7 @@ def main():
         logger.info("\n[退出] 收到终止信号，正在安全关闭 ...")
         stop_event.set()               # 通知所有工作线程停止
         state.abort_event.set()         # 中止正在进行的发送任务
+        state.clear_auto_reply()        # 停用自动回复，清空待发送队列
         try:
             listener.close()            # 关闭管道监听器，打断 accept() 阻塞
         except Exception:
@@ -595,6 +760,7 @@ def main():
     # ---- 启动服务 ----
     logger.info(f"[启动] 命名管道已就绪: {DEFAULT_PIPE_ADDRESS}")
     logger.info(f"[启动] 支持操作: run (发送报文), status (查看状态), abort (中止发送)")
+    logger.info(f"[启动]            auto_reply_start (启用自动回复), auto_reply_stop (停用), auto_reply_status (状态)")
     logger.info(f"[启动] 客户端断开连接时，当前发送任务会被自动中止")
     logger.info(f"[启动] 按 Ctrl+C 安全退出。")
     logger.info("-" * 60)
@@ -627,6 +793,7 @@ def main():
     finally:
         # ---- 清理资源 ----
         rx_thread.join(timeout=3)       # 等待接收线程结束
+        ar_tx_thread.join(timeout=3)    # 等待自动回复发送线程结束
         logger.info("[退出] 正在关闭 CAN 桥接释放物理设备 ...")
         dll.CloseCanBridge(args.dev_type, args.can_idx)
         logger.info("[退出] 桥接与物理通道已安全关闭，再见！")

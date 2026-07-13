@@ -2,4 +2,7 @@ simulators/simulate_bms.py
 simulators/simulate_speed_limit.py
 *.log
 *.pyc
-payload.py
+__pycache__/
+logs/
+payload/payload.py
+auto_reply/auto_reply_rules.py
