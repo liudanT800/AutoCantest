@@ -15,7 +15,7 @@ import os
 import json
 import argparse
 from multiprocessing.connection import Client
-from AutoCantest.auto_reply.auto_reply_rules_data import RAW_RULES
+from auto_reply_rules_data import RAW_RULES
 
 PIPE_ADDRESS = r'\\.\pipe\cantest_pipe'
 AUTH_KEY = b'cantest'

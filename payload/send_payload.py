@@ -16,11 +16,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
-# 确保 payload.py 存在，若不存在，自动从默认配置创建
-payload_path = os.path.join(script_dir, "payload.py")
+# 确保 payload_data.py 存在，若不存在，自动从默认配置创建
+payload_path = os.path.join(script_dir, "payload_data.py")
 if not os.path.exists(payload_path):
     default_payload = """
-        # CAN 报文发送配置 (已加入 .gitignore，本地修改不会被 Git 追踪)
+        # CAN 报文发送配置
         SEND_MODE = 1 # 1 or 2
         REPEAT_COUNT = 1000000
         SEND_DURATION_S = None  # 发送时间(秒)，与 REPEAT_COUNT 二选一，若设置了该值，则自动通过间隔和时长反推发送次数并覆盖 REPEAT_COUNT
@@ -40,7 +40,7 @@ if not os.path.exists(payload_path):
         f.write(default_payload)
 
 try:
-    from payload import (
+    from payload_data import (
         SEND_MODE,
         REPEAT_COUNT,
         SEND_DURATION_S,
