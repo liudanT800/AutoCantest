@@ -46,19 +46,21 @@ def normalize_raw_rules(raw_input):
 def parse_rule_line(line):
     """解析单行 raw 规则为服务期望的 dict。
     
-    格式: match_id  match_pattern  |  reply_id  reply_data  [delay_ms]
+    格式: match_id  match_pattern  |  reply_id  reply_data  [delay_ms]  [|  reply_id  reply_data  [delay_ms]  ...]
+    
+    支持多个 | 分隔的回复帧，实现单条规则触发的多帧连续回复。
     
     返回:
-        {"match_id": str, "match_pattern": str|None, "reply_frames": [{...}]}
+        {"match_id": str, "match_pattern": str|None, "reply_frames": [{...}, ...]}
         或 None（空行/注释行）
     """
     line = line.strip()
     if not line or line.startswith('#'):
         return None
 
-    # 按 | 分割 match 侧和 reply 侧
+    # 按 | 分割 match 侧和 reply 侧（支持多段 reply）
     parts = [p.strip() for p in line.split('|')]
-    if len(parts) != 2:
+    if len(parts) < 2:
         return None
 
     # --- 解析 match 侧 ---
@@ -79,32 +81,39 @@ def parse_rule_line(line):
     else:
         match_pattern = None
 
-    # --- 解析 reply 侧 ---
-    reply_tokens = parts[1].split()
-    if len(reply_tokens) < 2:
+    # --- 解析所有 reply 侧（parts[1:] 每段都是一帧回复）---
+    reply_frames = []
+    for reply_part in parts[1:]:
+        reply_tokens = reply_part.split()
+        if len(reply_tokens) < 2:
+            continue
+
+        reply_id = reply_tokens[0]
+        if not reply_id.lower().startswith('0x'):
+            reply_id = '0x' + reply_id
+
+        # 取前 8 个字节作为 data
+        data_tokens = reply_tokens[1:9]
+        reply_data = ' '.join(data_tokens) if data_tokens else '00 00 00 00 00 00 00 00'
+
+        reply_frame = {"id": reply_id, "data": reply_data}
+
+        # 可选 delay_ms（紧跟在 data 之后）
+        if len(reply_tokens) > 9:
+            try:
+                reply_frame["delay_ms"] = int(reply_tokens[9])
+            except ValueError:
+                pass
+
+        reply_frames.append(reply_frame)
+
+    if not reply_frames:
         return None
-
-    reply_id = reply_tokens[0]
-    if not reply_id.lower().startswith('0x'):
-        reply_id = '0x' + reply_id
-
-    # 取前 8 个字节作为 data
-    data_tokens = reply_tokens[1:9]
-    reply_data = ' '.join(data_tokens) if data_tokens else '00 00 00 00 00 00 00 00'
-
-    reply_frame = {"id": reply_id, "data": reply_data}
-
-    # 可选 delay_ms（紧跟在 data 之后）
-    if len(reply_tokens) > 9:
-        try:
-            reply_frame["delay_ms"] = int(reply_tokens[9])
-        except ValueError:
-            pass
 
     return {
         "match_id": match_id,
         "match_pattern": match_pattern,
-        "reply_frames": [reply_frame],
+        "reply_frames": reply_frames,
     }
 
 def save_cache(rules):

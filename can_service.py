@@ -28,7 +28,7 @@ from datetime import datetime
 
 # -- 硬件 & 通道 --
 DEFAULT_DEV_TYPE   = 4           # 设备类型: 4 = USBCAN2
-DEFAULT_BAUD_RATE  = 250         # 波特率 (kbps)
+DEFAULT_BAUD_RATE  = 125        # 波特率 (kbps)
 DEFAULT_CAN_IDX    = 0           # CAN 通道索引: 0 = CAN1, 1 = CAN2
 
 # -- 命名管道 --
@@ -243,7 +243,6 @@ class SharedState:
             data_part = msg_str.split("Data:")[1].strip()
             data_bytes = data_part.split()
 
-            # O(1) 字典查找
             rules = self.auto_reply_rules.get(msg_id)
             if not rules:
                 return
@@ -259,9 +258,10 @@ class SharedState:
                     # 非阻塞入队
                     for frame in reply_frames:
                         self.reply_queue.put(frame)
+                    logger.debug(f"[自动回复] 匹配命中 0x{msg_id:X}，入队 {len(reply_frames)} 帧")
                     return  # 首条匹配即停止
         except Exception:
-            pass  # 热路径静默吞异常，保证接收线程不崩溃
+            logger.error(f"[自动回复] check_auto_reply 异常: {msg_str[:100]}", exc_info=True)
 
 
 def _match_data_pattern(data_str: str, pattern: str) -> bool:
@@ -300,43 +300,59 @@ def _parse_id(raw_id) -> int:
 # ============================================================================
 # 线程 2.5：自动回复发送器 (后台守护线程)
 # ============================================================================
-def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState, stop_event: threading.Event):
+def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState, stop_event: threading.Event, log_file: str = ""):
     """独立发送线程，从 reply_queue 取帧发送，带可中断延迟，永不阻塞接收线程"""
+    # 打开发送日志文件（独立句柄，避免跨线程竞争）
+    ar_fh = None
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        ar_fh = open(log_file, "a", encoding="utf-8", buffering=1)
+
     logger.info("[自动回复] 发送线程已启动")
-    while not stop_event.is_set():
-        try:
-            reply_id, data_str, delay_ms = state.reply_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue
+    try:
+        while not stop_event.is_set():
+            try:
+                reply_id, data_str, delay_ms = state.reply_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
-        if stop_event.is_set():
-            break
+            if stop_event.is_set():
+                break
 
-        try:
-            if delay_ms > 0:
-                # 小步长 sleep，便于快速响应 stop_event
-                remaining = delay_ms / 1000.0
-                while remaining > 0 and not stop_event.is_set():
-                    time.sleep(min(remaining, 0.01))
-                    remaining -= 0.01
-                if stop_event.is_set():
-                    break
+            try:
+                if delay_ms > 0:
+                    # 小步长 sleep，便于快速响应 stop_event
+                    remaining = delay_ms / 1000.0
+                    while remaining > 0 and not stop_event.is_set():
+                        time.sleep(min(remaining, 0.01))
+                        remaining -= 0.01
+                    if stop_event.is_set():
+                        break
 
-            tx_data = data_str.encode("utf-8")
-            ret = dll.SendCanHex(dev_type, reply_id, tx_data, can_idx)
-            if ret == 1:
-                logger.debug(f"[自动回复] → 0x{reply_id:X} | {data_str}")
-            else:
-                logger.warning(f"[自动回复] SendCanHex 返回 {ret}")
-        except Exception as e:
-            logger.error(f"[自动回复] 发送异常: {e}")
+                tx_data = data_str.encode("utf-8")
+                ret = dll.SendCanHex(dev_type, reply_id, tx_data, can_idx)
+                if ret == 1:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    log_line = f"[{ts}] [TX_AUTO] CAN{can_idx}|ID:0x{reply_id:X}|Data:{data_str}"
+                    logger.info(f"[自动回复] → 0x{reply_id:X} | {data_str}")
+                    if ar_fh:
+                        ar_fh.write(log_line + "\n")
+                else:
+                    logger.warning(f"[自动回复] SendCanHex 返回 {ret}")
+            except Exception as e:
+                logger.error(f"[自动回复] 发送异常: {e}")
 
-    # 退出前清空队列避免残留
-    while not state.reply_queue.empty():
-        try:
-            state.reply_queue.get_nowait()
-        except queue.Empty:
-            break
+        # 退出前清空队列避免残留
+        while not state.reply_queue.empty():
+            try:
+                state.reply_queue.get_nowait()
+            except queue.Empty:
+                break
+    finally:
+        if ar_fh:
+            ar_fh.close()
     logger.info("[自动回复] 发送线程已停止")
 
 
@@ -375,7 +391,7 @@ def receiver_thread_func(dll, can_idx: int, state: SharedState, log_file: str, s
                 # 尝试与 expect 规则比对
                 state.check_and_match(msg_str)
 
-                # 尝试与自动回复规则比对 (O(1) 查表 + 异步入队，不阻塞)
+                # 尝试与自动回复规则比对
                 state.check_auto_reply(msg_str)
             else:
                 # 队列为空，短暂休眠以避免占满 CPU
@@ -670,7 +686,7 @@ def handle_connection(conn, dll, state: SharedState, cfg: dict, stop_event: thre
 def main():
     # ---- 命令行参数解析 ----
     parser = argparse.ArgumentParser(
-        description="CAN 测试常驻服务 (命名管道版本)",
+        description="CAN 测试服务器",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "客户端调用示例:\n"
@@ -725,7 +741,7 @@ def main():
     # ---- 启动自动回复发送线程 ----
     ar_tx_thread = threading.Thread(
         target=auto_reply_sender_func,
-        args=(dll, args.dev_type, args.can_idx, state, stop_event),
+        args=(dll, args.dev_type, args.can_idx, state, stop_event, args.log_file),
         name="AutoReplySender",
         daemon=True,
     )

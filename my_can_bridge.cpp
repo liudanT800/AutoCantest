@@ -22,6 +22,10 @@ static std::atomic<bool> g_deviceOpened(false);
 
 static std::vector<unsigned int> g_filterIDs[2];
 
+// 收发互斥锁：ControlCAN 的 VCI_Transmit / VCI_Receive 不是线程安全的，
+// 并发调用会导致驱动层静默崩溃。此锁确保同一通道上收发互斥。
+static CRITICAL_SECTION g_channelLock[2];
+
 // 线程局部存储，用于安全返回 const char* 指针，避免多线程访问冲突与内存泄露
 static thread_local std::string g_lastMessage;
 
@@ -32,6 +36,8 @@ struct BridgeLifetimeManager {
     BridgeLifetimeManager() {
         InitializeCriticalSection(&g_queueCriticalSection[0]);
         InitializeCriticalSection(&g_queueCriticalSection[1]);
+        InitializeCriticalSection(&g_channelLock[0]);
+        InitializeCriticalSection(&g_channelLock[1]);
     }
     ~BridgeLifetimeManager() {
         // 自动停止接收线程，防止内存泄露和进程崩溃
@@ -45,6 +51,8 @@ struct BridgeLifetimeManager {
         }
         DeleteCriticalSection(&g_queueCriticalSection[0]);
         DeleteCriticalSection(&g_queueCriticalSection[1]);
+        DeleteCriticalSection(&g_channelLock[0]);
+        DeleteCriticalSection(&g_channelLock[1]);
     }
 };
 static BridgeLifetimeManager g_lifetimeManager;
@@ -106,7 +114,10 @@ static DWORD WINAPI ReceiveThreadProc(LPVOID lpParam) {
     
     while (g_threadRunning[can_idx]) {
         // 调用 VCI_Receive 接收数据，超时时间设为 50ms 稀释 CPU 占用
+        // 加锁与 VCI_Transmit 互斥，防止驱动层并发崩溃
+        EnterCriticalSection(&g_channelLock[can_idx]);
         ULONG rx_num = VCI_Receive(dev_type, 0, can_idx, rx_objs, 200, 50);
+        LeaveCriticalSection(&g_channelLock[can_idx]);
         if (rx_num > 0) {
             EnterCriticalSection(&g_queueCriticalSection[can_idx]);
             for (ULONG i = 0; i < rx_num; ++i) {
@@ -286,8 +297,10 @@ __declspec(dllexport) int __stdcall SendCanHex(int dev_type, unsigned int id, co
     }
     std::memcpy(obj.Data, parsed_data, 8);
     
-    // 传输报文
+    // 传输报文 (加互斥锁，防止与接收线程的 VCI_Receive 并发导致驱动崩溃)
+    EnterCriticalSection(&g_channelLock[can_idx]);
     ULONG tx_res = VCI_Transmit(dev_type, 0, can_idx, &obj, 1);
+    LeaveCriticalSection(&g_channelLock[can_idx]);
     return (tx_res == 1) ? 1 : 0;
 }
 
