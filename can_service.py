@@ -681,7 +681,7 @@ def main():
     parser.add_argument("--can-idx", type=int, default=DEFAULT_CAN_IDX, help=f"通道索引 (默认 {DEFAULT_CAN_IDX} = CAN1)")
     # 默认日志文件名: logs/can_bus_YYYY-MM-DD.log
     default_log = os.path.join(DEFAULT_LOG_DIR, "can_bus.log")
-    parser.add_argument("--log-file", type=str, default=default_log, help=f"接收报文日志路径 (默认 logs/can_bus.log，含轮转后缀)")
+    parser.add_argument("--log-file", type=str, default=default_log, help=f"接收报文日志路径 (默认 logs/can_bus.log)")
     parser.add_argument("--log-rotation-when", type=str, default=DEFAULT_LOG_ROTATION_WHEN,
                         choices=["S", "M", "H", "D", "midnight"] + [f"W{i}" for i in range(7)],
                         help=f"日志轮转单位 (默认 {DEFAULT_LOG_ROTATION_WHEN}=每小时)")
@@ -710,6 +710,23 @@ def main():
     _file_handler.setFormatter(file_formatter)
     # 轮转后的文件名后缀 (如 can_bus.log.2026-07-14_15-00-00)
     _file_handler.suffix = "%Y-%m-%d_%H-%M-%S"
+
+    # ---- 自定义轮转规则：将轮转出的旧日志存入 archive 子文件夹 ----
+    def _log_namer(default_name: str) -> str:
+        """将默认轮转文件名重定向到 logs/archive/ 子目录"""
+        base_dir = os.path.dirname(default_name)
+        base_filename = os.path.basename(default_name)
+        archive_dir = os.path.join(base_dir, "archive")
+        return os.path.join(archive_dir, base_filename)
+
+    def _log_rotator(source: str, dest: str):
+        """轮转时自动创建 archive 目录并将日志移入"""
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        os.rename(source, dest)
+
+    _file_handler.namer = _log_namer
+    _file_handler.rotator = _log_rotator
+
     logger.addHandler(_file_handler)
 
     # ---- 加载 DLL ----
