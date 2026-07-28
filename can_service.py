@@ -19,6 +19,7 @@ import signal
 import threading
 import queue
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from multiprocessing.connection import Listener
 from datetime import datetime
 
@@ -39,6 +40,12 @@ PIPE_AUTH_KEY        = b'cantest'
 DEFAULT_LOG_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")  # 日志目录
 DEFAULT_LOG_FILE   = None  # 运行时自动生成: logs/can_bus_YYYY-MM-DD.log
 DEFAULT_LOG_LEVEL  = logging.DEBUG  # 日志级别 (DEBUG / INFO / WARNING)
+
+# -- 日志轮转 (TimedRotatingFileHandler) --
+# 轮转单位: "S"=秒, "M"=分钟, "H"=小时, "D"=天, "midnight"=午夜, "W0"~"W6"=周几
+DEFAULT_LOG_ROTATION_WHEN        = "H"    # 轮转时间单位
+DEFAULT_LOG_ROTATION_INTERVAL    = 1      # 轮转间隔
+DEFAULT_LOG_ROTATION_BACKUP_COUNT = 48    # 保留文件数量 (48小时=2天)
 
 # -- 运行时内部参数 --
 RX_POLL_INTERVAL_S        = 0.005    # 接收线程空闲轮询间隔 (秒)
@@ -300,16 +307,8 @@ def _parse_id(raw_id) -> int:
 # ============================================================================
 # 线程 2.5：自动回复发送器 (后台守护线程)
 # ============================================================================
-def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState, stop_event: threading.Event, log_file: str = ""):
+def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState, stop_event: threading.Event):
     """独立发送线程，从 reply_queue 取帧发送，带可中断延迟，永不阻塞接收线程"""
-    # 打开发送日志文件（独立句柄，避免跨线程竞争）
-    ar_fh = None
-    if log_file:
-        log_dir = os.path.dirname(log_file)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        ar_fh = open(log_file, "a", encoding="utf-8", buffering=1)
-
     logger.info("[自动回复] 发送线程已启动")
     try:
         while not stop_event.is_set():
@@ -334,11 +333,7 @@ def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState,
                 tx_data = data_str.encode("utf-8")
                 ret = dll.SendCanHex(dev_type, reply_id, tx_data, can_idx)
                 if ret == 1:
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    log_line = f"[{ts}] [TX_AUTO] CAN{can_idx}|ID:0x{reply_id:X}|Data:{data_str}"
                     logger.info(f"[自动回复] → 0x{reply_id:X} | {data_str}")
-                    if ar_fh:
-                        ar_fh.write(log_line + "\n")
                 else:
                     logger.warning(f"[自动回复] SendCanHex 返回 {ret}")
             except Exception as e:
@@ -351,28 +346,19 @@ def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState,
             except queue.Empty:
                 break
     finally:
-        if ar_fh:
-            ar_fh.close()
+        pass
     logger.info("[自动回复] 发送线程已停止")
 
 
 # ============================================================================
 # 线程 2：CAN 总线接收器 (后台守护线程)
 # ============================================================================
-def receiver_thread_func(dll, can_idx: int, state: SharedState, log_file: str, stop_event: threading.Event):
+def receiver_thread_func(dll, can_idx: int, state: SharedState, stop_event: threading.Event):
     """
-    死循环调用 FetchReceivedMessage，实时打印 + 写日志 + 比对 expect。
+    死循环调用 FetchReceivedMessage，实时打印 + 写日志(走logger轮转) + 比对 expect。
     当 stop_event 被设置时，线程退出。
     """
-    # 确保日志目录存在
-    log_dir = os.path.dirname(log_file)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-
-    logger.info(f"[接收线程] 总线接收器已启动，通道 CAN{can_idx + 1}，日志文件: {log_file}")
-
-    # 打开日志文件 (追加写入)
-    fh = open(log_file, "a", encoding="utf-8", buffering=1)  # line-buffered
+    logger.info(f"[接收线程] 总线接收器已启动，通道 CAN{can_idx + 1}")
 
     try:
         while not stop_event.is_set():
@@ -383,10 +369,7 @@ def receiver_thread_func(dll, can_idx: int, state: SharedState, log_file: str, s
                 except UnicodeDecodeError:
                     msg_str = msg_ptr.decode("gbk", errors="replace")
 
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                log_line = f"[{ts}] [RX] {msg_str}"
                 logger.info(f"[RX] {msg_str}")
-                fh.write(log_line + "\n")
 
                 # 尝试与 expect 规则比对
                 state.check_and_match(msg_str)
@@ -397,7 +380,6 @@ def receiver_thread_func(dll, can_idx: int, state: SharedState, log_file: str, s
                 # 队列为空，短暂休眠以避免占满 CPU
                 time.sleep(RX_POLL_INTERVAL_S)
     finally:
-        fh.close()
         logger.info("[接收线程] 总线接收器已停止。")
 
 
@@ -698,9 +680,37 @@ def main():
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD_RATE, help=f"波特率 kbps (默认 {DEFAULT_BAUD_RATE})")
     parser.add_argument("--can-idx", type=int, default=DEFAULT_CAN_IDX, help=f"通道索引 (默认 {DEFAULT_CAN_IDX} = CAN1)")
     # 默认日志文件名: logs/can_bus_YYYY-MM-DD.log
-    default_log = os.path.join(DEFAULT_LOG_DIR, f"can_bus_{datetime.now().strftime('%Y-%m-%d')}.log")
-    parser.add_argument("--log-file", type=str, default=default_log, help=f"接收报文日志路径 (默认 logs/can_bus_<日期>.log)")
+    default_log = os.path.join(DEFAULT_LOG_DIR, "can_bus.log")
+    parser.add_argument("--log-file", type=str, default=default_log, help=f"接收报文日志路径 (默认 logs/can_bus.log，含轮转后缀)")
+    parser.add_argument("--log-rotation-when", type=str, default=DEFAULT_LOG_ROTATION_WHEN,
+                        choices=["S", "M", "H", "D", "midnight"] + [f"W{i}" for i in range(7)],
+                        help=f"日志轮转单位 (默认 {DEFAULT_LOG_ROTATION_WHEN}=每小时)")
+    parser.add_argument("--log-rotation-interval", type=int, default=DEFAULT_LOG_ROTATION_INTERVAL,
+                        help=f"轮转间隔 (默认 {DEFAULT_LOG_ROTATION_INTERVAL})")
+    parser.add_argument("--log-backup-count", type=int, default=DEFAULT_LOG_ROTATION_BACKUP_COUNT,
+                        help=f"保留日志文件数 (默认 {DEFAULT_LOG_ROTATION_BACKUP_COUNT})")
     args = parser.parse_args()
+
+    # ---- 配置文件日志轮转 (TimedRotatingFileHandler) ----
+    # 从控制台 handler 复用相同的格式化器
+    file_formatter = _MillisecondFormatter(
+        "[%(asctime)s] %(levelname)-7s %(message)s"
+    )
+    # 确保日志目录存在
+    os.makedirs(os.path.dirname(os.path.abspath(args.log_file)), exist_ok=True)
+    _file_handler = TimedRotatingFileHandler(
+        filename=args.log_file,
+        when=args.log_rotation_when,
+        interval=args.log_rotation_interval,
+        backupCount=args.log_backup_count,
+        encoding="utf-8",
+        utc=False,
+    )
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(file_formatter)
+    # 轮转后的文件名后缀 (如 can_bus.log.2026-07-14_15-00-00)
+    _file_handler.suffix = "%Y-%m-%d_%H-%M-%S"
+    logger.addHandler(_file_handler)
 
     # ---- 加载 DLL ----
     logger.info("=" * 60)
@@ -732,7 +742,7 @@ def main():
     # ---- 启动接收线程 (CAN 总线监听) ----
     rx_thread = threading.Thread(
         target=receiver_thread_func,
-        args=(dll, args.can_idx, state, args.log_file, stop_event),
+        args=(dll, args.can_idx, state, stop_event),
         name="CAN_Receiver",
         daemon=True,
     )
@@ -741,7 +751,7 @@ def main():
     # ---- 启动自动回复发送线程 ----
     ar_tx_thread = threading.Thread(
         target=auto_reply_sender_func,
-        args=(dll, args.dev_type, args.can_idx, state, stop_event, args.log_file),
+        args=(dll, args.dev_type, args.can_idx, state, stop_event),
         name="AutoReplySender",
         daemon=True,
     )
@@ -775,6 +785,7 @@ def main():
 
     # ---- 启动服务 ----
     logger.info(f"[启动] 命名管道已就绪: {DEFAULT_PIPE_ADDRESS}")
+    logger.info(f"[启动] 日志文件: {os.path.abspath(args.log_file)} (每{args.log_rotation_interval}{args.log_rotation_when}轮转, 保留{args.log_backup_count}个)")
     logger.info(f"[启动] 支持操作: run (发送报文), status (查看状态), abort (中止发送)")
     logger.info(f"[启动]            auto_reply_start (启用自动回复), auto_reply_stop (停用), auto_reply_status (状态)")
     logger.info(f"[启动] 客户端断开连接时，当前发送任务会被自动中止")

@@ -143,10 +143,21 @@ def load_cache():
 # 2. raw 解析为空时，回退读取 JSON 缓存
 raw_lines = normalize_raw_rules(RAW_RULES)
 AUTO_REPLY_RULES = []
+long_line = ""
+def long_read():
+    if long_line:
+        rule = parse_rule_line(long_line)
+        if rule:
+            AUTO_REPLY_RULES.append(rule)
 for line in raw_lines:
-    rule = parse_rule_line(line)
-    if rule:
-        AUTO_REPLY_RULES.append(rule)
+    if line.strip().startswith("|"):
+        # 续行，拼接到上一行
+        long_line += " " + line.strip()
+        continue
+    else:
+        long_read()
+        long_line = line.strip()
+long_read()  # 处理最后一行
 
 if AUTO_REPLY_RULES:
     # raw 解析成功，更新 JSON 缓存
