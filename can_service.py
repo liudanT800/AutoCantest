@@ -39,7 +39,7 @@ PIPE_AUTH_KEY        = b'cantest'
 # -- 日志 --
 DEFAULT_LOG_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")  # 日志目录
 DEFAULT_LOG_FILE   = None  # 运行时自动生成: logs/can_bus_YYYY-MM-DD.log
-DEFAULT_LOG_LEVEL  = logging.DEBUG  # 日志级别 (DEBUG / INFO / WARNING)
+DEFAULT_LOG_LEVEL  = logging.INFO  # 日志级别 (DEBUG / INFO / WARNING)
 
 # -- 日志轮转 (TimedRotatingFileHandler) --
 # 轮转单位: "S"=秒, "M"=分钟, "H"=小时, "D"=天, "midnight"=午夜, "W0"~"W6"=周几
@@ -52,7 +52,7 @@ RX_POLL_INTERVAL_S        = 0.005    # 接收线程空闲轮询间隔 (秒)
 DEFAULT_TX_DATA           = "00 00 00 00 00 00 00 00"  # 帧数据缺省值 (8字节)
 DEFAULT_EXPECT_TIMEOUT_MS = 2000   # expect 匹配默认超时 (毫秒)
 AUTO_REPLY_POLL_INTERVAL_S = 0.001  # 自动回复发送线程队列轮询间隔
-
+ 
 
 # ============================================================================
 # 日志配置
@@ -265,7 +265,7 @@ class SharedState:
                     # 非阻塞入队
                     for frame in reply_frames:
                         self.reply_queue.put(frame)
-                    logger.debug(f"[自动回复] 匹配命中 0x{msg_id:X}，入队 {len(reply_frames)} 帧")
+                    logger.info(f"[自动回复] 匹配命中 0x{msg_id:X}，入队 {len(reply_frames)} 帧")
                     return  # 首条匹配即停止
         except Exception:
             logger.error(f"[自动回复] check_auto_reply 异常: {msg_str[:100]}", exc_info=True)
@@ -335,7 +335,7 @@ def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState,
                 if ret == 1:
                     logger.info(f"[自动回复] → 0x{reply_id:X} | {data_str}")
                 else:
-                    logger.warning(f"[自动回复] SendCanHex 返回 {ret}")
+                    logger.debug(f"[自动回复] SendCanHex 返回 {ret}")
             except Exception as e:
                 logger.error(f"[自动回复] 发送异常: {e}")
 
@@ -355,7 +355,8 @@ def auto_reply_sender_func(dll, dev_type: int, can_idx: int, state: SharedState,
 # ============================================================================
 def receiver_thread_func(dll, can_idx: int, state: SharedState, stop_event: threading.Event):
     """
-    死循环调用 FetchReceivedMessage，实时打印 + 写日志(走logger轮转) + 比对 expect。
+    死循环调用 FetchReceivedMessage，比对 expect / 自动回复查表。
+    RX 帧仅写 DEBUG 日志（长发帧不污染 INFO 级别日志）。
     当 stop_event 被设置时，线程退出。
     """
     logger.info(f"[接收线程] 总线接收器已启动，通道 CAN{can_idx + 1}")
@@ -444,7 +445,7 @@ def execute_run_task(dll, state: SharedState, cfg: dict, task: dict) -> dict:
             logger.info("[TX] 发送任务收到中止指令，停止发送！")
             break
 
-        logger.info(f"[TX] === 第 {g_idx + 1}/{repeat_count} 组报文 ===")
+        logger.debug(f"[TX] === 第 {g_idx + 1}/{repeat_count} 组报文 ===")
 
         for f_idx, frame in enumerate(frames):
             if state.abort_event.is_set():
@@ -459,7 +460,7 @@ def execute_run_task(dll, state: SharedState, cfg: dict, task: dict) -> dict:
             data_str = frame.get("data", DEFAULT_TX_DATA)
             tx_data = data_str.encode("utf-8")
 
-            logger.info(f'[TX] Frame {f_idx + 1}: ID=0x{id_val:X}, Data="{data_str}"')
+            logger.debug(f'[TX] Frame {f_idx + 1}: ID=0x{id_val:X}, Data="{data_str}"')
             ret = dll.SendCanHex(dev_type, id_val, tx_data, can_idx)
             if ret == 1:
                 total_sent += 1
